@@ -7,15 +7,19 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog
                             QProgressBar, QCheckBox, QGroupBox, QGridLayout, 
                             QSplitter, QFrame, QStyleFactory, QToolButton, QStyle,
                             QTabWidget, QListWidget, QListWidgetItem, QStackedWidget,
-                            QRadioButton)
+                            QRadioButton, QSettings)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
 from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
 
 # 导入自定义模块
 from ui.styles import STYLE_SHEET
 from ui.column_selector import ColumnSelector
+from ui.model_manager_widget import ModelManagerWidget
+from ui.model_settings_widget import ModelSettingsWidget
 from core.deduplication import deduplicate_dataframe
 from core.batch_thread import BatchProcessingThread, ExcelInspectionThread
+from core.model_manager import get_model_manager
+from core.model_inference import get_model_service
 
 # 工具线程
 class DeduplicationThread(QThread):
@@ -82,12 +86,26 @@ class ExcelDeduplicationTool(QMainWindow):
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(15)
         
+        # 创建选项卡小部件
+        tab_widget = QTabWidget()
+        
         # 创建批处理选项卡
         batch_processing_tab = QWidget()
         self.setup_batch_processing_tab(batch_processing_tab)
         
-        # 将选项卡添加到主布局
-        main_layout.addWidget(batch_processing_tab)
+        # 创建模型管理选项卡
+        model_management_tab = self.create_model_management_tab()
+        
+        # 创建模型设置选项卡
+        model_settings_tab = self.create_model_settings_tab()
+        
+        # 将选项卡添加到选项卡小部件
+        tab_widget.addTab(batch_processing_tab, "批量处理")
+        tab_widget.addTab(model_management_tab, "模型管理")
+        tab_widget.addTab(model_settings_tab, "模型设置")
+        
+        # 添加选项卡小部件到主布局
+        main_layout.addWidget(tab_widget)
         
         # 设置主窗口部件
         self.setCentralWidget(main_widget)
@@ -258,31 +276,60 @@ class ExcelDeduplicationTool(QMainWindow):
         keep_layout.setContentsMargins(0, 0, 0, 0)
         
         keep_label = QLabel('保留重复项:')
-        self.batch_keep_combo = QComboBox()
-        self.batch_keep_combo.addItems(['first (保留首次出现)', 'last (保留最后出现)', 'False (全部删除)'])
-        self.batch_keep_combo.setCurrentIndex(0)
-        self.batch_keep_combo.currentIndexChanged.connect(self.update_column_selector_keep_option)
+        self.keep_option_combo = QComboBox()
+        self.keep_option_combo.addItem('保留首次出现的记录', 'first')
+        self.keep_option_combo.addItem('保留最后出现的记录', 'last')
+        self.keep_option_combo.currentIndexChanged.connect(self.update_column_selector_keep_option)
         
         keep_layout.addWidget(keep_label)
-        keep_layout.addWidget(self.batch_keep_combo)
+        keep_layout.addWidget(self.keep_option_combo)
         keep_layout.addStretch(1)
         
+        # 模型相似度设置
+        model_frame = QFrame()
+        model_layout = QHBoxLayout(model_frame)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.use_model_check = QCheckBox('使用模型进行相似度计算')
+        self.use_model_check.setToolTip('启用后将使用深度学习模型计算文本相似度，提高准确性但会降低处理速度')
+        
+        # 检查模型功能是否启用
+        settings = QSettings("ExcelDeduplication", "ModelSettings")
+        enable_model = settings.value("enable_model", False, type=bool)
+        
+        self.use_model_check.setChecked(enable_model)
+        self.use_model_check.setEnabled(enable_model)  # 如果全局设置禁用，则禁用勾选框
+        
+        # 如果模型功能被禁用，添加提示
+        if not enable_model:
+            self.use_model_check.setToolTip('模型功能已在设置中被禁用，请在"模型设置"选项卡中启用')
+        
+        # 模型选择下拉框
+        model_select_label = QLabel('使用模型:')
+        self.model_select_combo = QComboBox()
+        self.update_model_select_combo()
+        self.model_select_combo.setEnabled(enable_model and self.use_model_check.isChecked())
+        
+        # 连接信号
+        self.use_model_check.toggled.connect(self.on_use_model_toggled)
+        
+        model_layout.addWidget(self.use_model_check)
+        model_layout.addStretch(1)
+        model_layout.addWidget(model_select_label)
+        model_layout.addWidget(self.model_select_combo)
+        
         # 列选择组件
-        columns_label = QLabel("选择作为去重依据的列（每个文件每个表都可独立选择）:")
-        columns_label.setStyleSheet("font-weight: bold;")
-        
         self.column_selector = ColumnSelector()
-        self.column_selector.selection_changed.connect(self.on_dedup_config_changed)
+        self.column_selector.on_config_changed.connect(self.on_dedup_config_changed)
         
-        # 添加到设置布局
+        # 将所有组件添加到设置区域
         settings_layout.addWidget(keep_frame)
-        settings_layout.addWidget(columns_label)
-        settings_layout.addWidget(self.column_selector, 1)  # 列选择器占据更多空间
-        
+        settings_layout.addWidget(model_frame)
+        settings_layout.addWidget(self.column_selector)
         settings_group.setLayout(settings_layout)
         
         # 添加到页面
-        layout.addWidget(settings_group, 1)
+        layout.addWidget(settings_group)
         
         return page
         
@@ -383,15 +430,15 @@ class ExcelDeduplicationTool(QMainWindow):
         output_dir_layout.setContentsMargins(0, 0, 0, 0)
         
         output_dir_label = QLabel('输出目录:')
-        self.output_dir_label = QLabel('未选择')
-        self.output_dir_label.setWordWrap(True)
+        self.output_dir_edit = QLabel('未选择')
+        self.output_dir_edit.setWordWrap(True)
         
         self.browse_output_button = QPushButton('选择')
         self.browse_output_button.setIcon(QApplication.style().standardIcon(QStyle.SP_DialogSaveButton))
         self.browse_output_button.clicked.connect(self.browse_output_dir)
         
         output_dir_layout.addWidget(output_dir_label)
-        output_dir_layout.addWidget(self.output_dir_label, 1)
+        output_dir_layout.addWidget(self.output_dir_edit, 1)
         output_dir_layout.addWidget(self.browse_output_button)
         
         # 输出文件后缀设置
@@ -641,47 +688,56 @@ class ExcelDeduplicationTool(QMainWindow):
         )
         
         if output_dir:
-            self.output_dir_label.setText(output_dir)
+            self.output_dir_edit.setText(output_dir)
     
     def start_batch_processing(self):
-        """开始批量去重处理"""
-        # 检查文件列表是否为空
+        """开始批处理"""
+        # 检查是否有文件
         if not self.batch_files:
-            QMessageBox.warning(self, '警告', '请先添加文件')
+            QMessageBox.warning(self, "错误", "请先添加要处理的文件")
             return
-            
-        # 检查是否已执行文件检查
-        if not self.file_infos:
-            QMessageBox.warning(self, '警告', '请先检查文件')
+        
+        # 检查是否配置了去重列
+        if not self.column_selector.has_selections():
+            QMessageBox.warning(self, "错误", "请至少为一个工作表选择去重依据列")
             return
+        
+        # 获取输出目录
+        output_dir = self.output_dir_edit.text()
+        if not output_dir:
+            # 如果未指定输出目录，弹出选择对话框
+            output_dir = QFileDialog.getExistingDirectory(
+                self, 
+                "选择输出目录",
+                os.path.dirname(self.batch_files[0]) if self.batch_files else ""
+            )
             
+            if not output_dir:
+                return  # 用户取消了选择
+                
+            self.output_dir_edit.setText(output_dir)
+        
         # 获取去重配置
         dedup_configs = self.column_selector.get_deduplication_configs()
-        if not dedup_configs:
-            QMessageBox.warning(self, '警告', '请选择至少一个列作为去重依据')
-            return
-            
-        # 检查输出目录
-        output_dir = self.output_dir_label.text()
-        if output_dir == '未选择':
-            QMessageBox.warning(self, '警告', '请选择输出目录')
-            return
-            
-        # 禁用按钮
+        keep_option = self.keep_option_combo.currentData()
+        
+        # 获取模型设置
+        use_model = self.use_model_check.isChecked()
+        model_id = self.model_select_combo.currentData() if use_model else None
+        
+        # 更新配置中的模型设置
+        for file_path, file_config in dedup_configs.items():
+            for sheet_name, sheet_config in file_config.items():
+                sheet_config['keep_option'] = keep_option
+                sheet_config['use_model'] = use_model
+                sheet_config['model_id'] = model_id
+        
+        # 禁用界面元素
         self.batch_start_button.setEnabled(False)
         self.batch_stop_button.setEnabled(True)
         
-        # 重置进度显示
-        self.batch_progress_bar.setValue(0)
-        self.batch_current_file_label.setText('准备中...')
-        self.batch_stats_label.setText('正在进行批量去重...')
-        self.batch_results_list.clear()
-        
-        # 创建并启动批处理线程
-        self.batch_thread = BatchProcessingThread(
-            self.batch_files,
-            dedup_configs
-        )
+        # 创建并启动处理线程
+        self.batch_thread = BatchProcessingThread(self.batch_files, dedup_configs)
         
         # 连接信号
         self.batch_thread.progress_signal.connect(self.update_batch_progress)
@@ -690,8 +746,19 @@ class ExcelDeduplicationTool(QMainWindow):
         self.batch_thread.batch_completed_signal.connect(self.handle_batch_completed)
         self.batch_thread.error_signal.connect(self.handle_batch_error)
         
-        # 启动线程
+        # 开始处理
         self.batch_thread.start()
+        
+        # 清空结果区域
+        self.batch_results_list.clear()
+        
+        # 显示处理中消息
+        self.batch_stats_label.setText("批处理进行中...")
+        self.batch_stats_label.setStyleSheet("color: blue;")
+        
+        # 更新进度条
+        self.batch_progress_bar.setValue(0)
+        self.batch_progress_bar.setVisible(True)
     
     def stop_batch_processing(self):
         """停止批量处理"""
@@ -742,7 +809,7 @@ class ExcelDeduplicationTool(QMainWindow):
         try:
             if report['success_count'] > 0:
                 # 获取输出目录
-                output_dir = self.output_dir_label.text()
+                output_dir = self.output_dir_edit.text()
                 
                 # 获取文件后缀
                 file_suffix = self.suffix_input.currentText()
@@ -884,9 +951,30 @@ class ExcelDeduplicationTool(QMainWindow):
 
     def update_column_selector_keep_option(self):
         """根据当前选择的保留选项更新列选择器配置"""
-        keep_option = self.batch_keep_combo.currentText().split(' ')[0]  # 提取选项前面的英文值
+        keep_option = self.keep_option_combo.currentData()
         self.column_selector.set_keep_option(keep_option)
+    
+    def update_model_select_combo(self):
+        """更新模型选择下拉框"""
+        self.model_select_combo.clear()
         
+        # 获取所有已下载的模型
+        model_manager = get_model_manager()
+        models = model_manager.get_downloaded_models()
+        
+        if models:
+            # 添加所有可用模型
+            for model in models:
+                self.model_select_combo.addItem(model.name, model.model_id)
+        else:
+            # 如果没有可用模型，添加提示项
+            self.model_select_combo.addItem("未找到可用模型", "")
+            self.model_select_combo.setEnabled(False)
+    
+    def on_use_model_toggled(self, checked):
+        """模型使用选项变更处理"""
+        self.model_select_combo.setEnabled(checked)
+
     def on_dedup_config_changed(self, configs):
         """处理去重配置变化"""
         # 配置变化时，可以在这里更新UI或存储配置
@@ -1154,6 +1242,34 @@ class ExcelDeduplicationTool(QMainWindow):
         
         # 刷新显示
         self.display_preview_data(file_path, sheet_name)
+
+    def create_model_management_tab(self):
+        """创建模型管理选项卡"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # 创建模型管理器组件
+        self.model_manager_widget = ModelManagerWidget()
+        
+        # 添加到布局
+        layout.addWidget(self.model_manager_widget)
+        
+        return tab
+    
+    def create_model_settings_tab(self):
+        """创建模型设置选项卡"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # 创建模型设置组件
+        self.model_settings_widget = ModelSettingsWidget()
+        
+        # 添加到布局
+        layout.addWidget(self.model_settings_widget)
+        
+        return tab
 
 # 程序入口
 def main():

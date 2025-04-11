@@ -6,7 +6,7 @@ class ColumnSelector(QWidget):
     """树形列选择器，支持选择文件、工作表和列"""
     
     # 自定义信号
-    selection_changed = pyqtSignal(dict)  # 选择变化时发出的信号，参数为当前选择的配置
+    on_config_changed = pyqtSignal(dict)  # 选择变化时发出的信号，参数为当前选择的配置
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -115,7 +115,7 @@ class ColumnSelector(QWidget):
         """处理项目选择状态变化"""
         # 如果状态改变，发出信号
         configs = self.get_deduplication_configs()
-        self.selection_changed.emit(configs)
+        self.on_config_changed.emit(configs)
     
     def select_all(self):
         """选择所有文件和列"""
@@ -196,4 +196,21 @@ class ColumnSelector(QWidget):
         self.tree.clear()
         self.file_infos = {}
         self.sheet_items = {}
-        self.column_items = {} 
+        self.column_items = {}
+    
+    def has_selections(self):
+        """检查是否有选择的列
+        
+        Returns:
+            bool: 如果至少有一个列被选择，返回True，否则返回False
+        """
+        # 遍历所有文件
+        for file_path, sheet_items in self.sheet_items.items():
+            # 遍历文件的所有工作表
+            for sheet_name, sheet_item in sheet_items.items():
+                # 检查此工作表中是否有选中的列
+                for column, column_item in self.column_items[file_path][sheet_name].items():
+                    if column_item.checkState(0) == Qt.Checked:
+                        return True
+        
+        return False 

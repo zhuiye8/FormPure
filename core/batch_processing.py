@@ -1,7 +1,7 @@
 # 批处理功能核心模块
 import os
 import pandas as pd
-from core.deduplication import deduplicate_dataframe
+from core.deduplication import deduplicate_dataframe, deduplicate_with_similarity
 
 class BatchProcessor:
     """批量Excel文件处理器"""
@@ -39,7 +39,9 @@ class BatchProcessor:
                 {
                     "sheet_name1": {
                         "key_columns": ["col1", "col2"],
-                        "keep_option": "first"
+                        "keep_option": "first",
+                        "use_model": true,  # 是否使用模型
+                        "model_id": "model_id"  # 模型ID
                     },
                     "sheet_name2": {
                         "key_columns": ["col3"],
@@ -65,12 +67,52 @@ class BatchProcessor:
                 sheet_rows = len(df_original)
                 total_rows += sheet_rows
                 
+                # 获取配置
+                keep_option = config.get('keep_option', 'first')
+                use_model = config.get('use_model', False)
+                model_id = config.get('model_id', None)
+                
+                # 获取要进行相似度比较的列
+                similarity_columns = {}
+                for col in config.get('key_columns', []):
+                    # 如果列名包含文本(如名称、描述等)，使用相似度比较
+                    is_text_column = False
+                    for keyword in ['name', 'title', 'desc', 'text', 'content', 'addr', '名', '称', '标题', '内容', '描述', '地址']:
+                        if keyword in col.lower():
+                            is_text_column = True
+                            break
+                    
+                    # 检测数据类型，如果有对象型(包含字符串)类型，视为文本列
+                    if df_original[col].dtype == 'object':
+                        # 抽样检查，如果有50%以上是字符串且长度>3，视为文本列
+                        sample = df_original[col].sample(min(100, len(df_original))).astype(str)
+                        text_ratio = sum(sample.str.len() > 3) / len(sample)
+                        if text_ratio > 0.5:
+                            is_text_column = True
+                    
+                    # 添加到相似度列配置
+                    if is_text_column:
+                        similarity_columns[col] = 'word_based'  # 默认使用分词相似度
+                
                 # 执行去重操作
-                df_deduplicated = deduplicate_dataframe(
-                    df_original, 
-                    config['key_columns'],
-                    config.get('keep_option', 'first')
-                )
+                if similarity_columns and use_model:
+                    # 有文本列且启用模型，使用相似度去重
+                    exact_columns = [col for col in config.get('key_columns', []) if col not in similarity_columns]
+                    df_deduplicated, _ = deduplicate_with_similarity(
+                        df_original,
+                        exact_key_columns=exact_columns,
+                        similarity_columns=similarity_columns,
+                        keep_option=keep_option,
+                        use_model=use_model,
+                        model_id=model_id
+                    )
+                else:
+                    # 无文本列或未启用模型，使用精确去重
+                    df_deduplicated = deduplicate_dataframe(
+                        df_original, 
+                        config['key_columns'],
+                        keep_option
+                    )
                 
                 # 计算结果统计
                 sheet_remaining = len(df_deduplicated)
